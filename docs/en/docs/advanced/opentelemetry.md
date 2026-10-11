@@ -108,6 +108,8 @@ OpenTelemetry uses global providers by default. Independent telemetry configurat
 
 By default, request traces include spans for resolving dependencies, running your path operation function, serializing the response, and running each task in FastAPI's `BackgroundTasks`. These spans use the same provider and exporters.
 
+Streaming path operations record one span for running the generator, including a sync generator in a thread pool. That span is current while the generator runs, and not while FastAPI encodes the next chunk or sends a Server-Sent Events keepalive comment. JSON Lines and Server-Sent Events also record a serialization span for each line or event. Raw byte streams do not record serialization spans.
+
 Background task spans remain part of the request's trace. They run after the HTTP response span ends, so they do not increase the measured response time.
 
 To record only the HTTP request span, set `operation_spans` to `False`:
