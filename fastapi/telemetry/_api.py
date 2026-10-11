@@ -187,6 +187,34 @@ def _normal_websocket_disconnect(exc: BaseException) -> bool:
     return isinstance(exc, WebSocketDisconnect) and exc.code in (1000, 1001)
 
 
+def _operation_attributes(
+    function: Callable[..., Any] | None,
+) -> dict[str, Any]:
+    attributes: dict[str, Any] = {}
+    if function is not None:
+        module = getattr(function, "__module__", type(function).__module__)
+        qualname = getattr(function, "__qualname__", type(function).__qualname__)
+        attributes["code.function.name"] = f"{module}.{qualname}"
+    return attributes
+
+
+def _mark_operation_error(*, span: Span, name: str, exc: Exception) -> None:
+    if name == "background_task" or (
+        not isinstance(
+            exc,
+            (
+                HTTPException,
+                RequestValidationError,
+                WebSocketException,
+                WebSocketRequestValidationError,
+            ),
+        )
+        and not _normal_websocket_disconnect(exc)
+    ):
+        span.set_attribute("error.type", _exception_type(exc))
+        span.set_status(StatusCode.ERROR)
+
+
 def _operation(
     *, name: str, function: Callable[..., Any] | None = None
 ) -> AbstractContextManager[None]:
@@ -206,34 +234,16 @@ def _traced_operation(
     function: Callable[..., Any] | None,
 ) -> Iterator[None]:
     assert request_telemetry.tracer is not None
-    attributes = {}
-    if function is not None:
-        module = getattr(function, "__module__", type(function).__module__)
-        qualname = getattr(function, "__qualname__", type(function).__qualname__)
-        attributes["code.function.name"] = f"{module}.{qualname}"
     with request_telemetry.tracer.start_as_current_span(
         f"fastapi.{name}",
-        attributes=attributes,
+        attributes=_operation_attributes(function),
         record_exception=False,
         set_status_on_exception=False,
     ) as span:
         try:
             yield
         except Exception as exc:
-            if name == "background_task" or (
-                not isinstance(
-                    exc,
-                    (
-                        HTTPException,
-                        RequestValidationError,
-                        WebSocketException,
-                        WebSocketRequestValidationError,
-                    ),
-                )
-                and not _normal_websocket_disconnect(exc)
-            ):
-                span.set_attribute("error.type", _exception_type(exc))
-                span.set_status(StatusCode.ERROR)
+            _mark_operation_error(span=span, name=name, exc=exc)
             raise
 
 
