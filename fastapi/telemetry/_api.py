@@ -10,7 +10,7 @@ from opentelemetry import context as otel_context
 from opentelemetry._logs import Logger, LoggerProvider, SeverityNumber
 from opentelemetry.context import Context
 from opentelemetry.metrics import MeterProvider
-from opentelemetry.trace import Span, StatusCode, Tracer, TracerProvider
+from opentelemetry.trace import Span, StatusCode, Tracer, TracerProvider, use_span
 from starlette.exceptions import HTTPException, WebSocketException
 from starlette.requests import Request
 from starlette.websockets import WebSocket, WebSocketDisconnect
@@ -245,6 +245,67 @@ def _traced_operation(
         except Exception as exc:
             _mark_operation_error(span=span, name=name, exc=exc)
             raise
+
+
+class _StreamingOperation:
+    """One operation span that can be current for slices of a stream.
+
+    The span stays open across yields. ``current()`` makes it current only
+    while generator code runs, so FastAPI's encoder and tasks started outside
+    those slices do not become children.
+    """
+
+    def __init__(self, span: Span | None, name: str) -> None:
+        self._span = span
+        self._name = name
+
+    @contextmanager
+    def current(self) -> Iterator[None]:
+        span = self._span
+        if span is None:
+            yield
+            return
+        try:
+            with use_span(
+                span,
+                end_on_exit=False,
+                record_exception=False,
+                set_status_on_exception=False,
+            ):
+                yield
+        except Exception as exc:
+            _mark_operation_error(span=span, name=self._name, exc=exc)
+            raise
+
+    def end(self) -> None:
+        span = self._span
+        if span is not None:
+            self._span = None
+            span.end()
+
+
+@contextmanager
+def _streaming_operation(
+    *, name: str, function: Callable[..., Any] | None = None
+) -> Iterator[_StreamingOperation]:
+    request_telemetry = _get_request_telemetry()
+    tracer = None if request_telemetry is None else request_telemetry.tracer
+    if tracer is None:
+        operation = _StreamingOperation(None, name)
+    else:
+        operation = _StreamingOperation(
+            tracer.start_span(
+                f"fastapi.{name}",
+                attributes=_operation_attributes(function),
+                record_exception=False,
+                set_status_on_exception=False,
+            ),
+            name,
+        )
+    try:
+        yield operation
+    finally:
+        operation.end()
 
 
 def _run_sync_endpoint(

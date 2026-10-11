@@ -85,6 +85,7 @@ from fastapi.telemetry._api import (
     _operation,
     _route_selected,
     _run_sync_endpoint,
+    _streaming_operation,
     _validation_failed,
     get_telemetry_data,
 )
@@ -364,6 +365,54 @@ async def run_endpoint_function(
         )
 
 
+def _sync_endpoint_stream(
+    function: Callable[..., Any] | None,
+    source: Iterator[Any],
+    serialize_item: Callable[[Any], bytes] | None,
+) -> Iterator[Any]:
+    # One endpoint span covers the generator. It is current only around next(),
+    # which runs in the worker thread StreamingResponse uses for sync iterators.
+    # Encoding happens after that, as a sibling span, and the span is not current
+    # across yield.
+    with _streaming_operation(name="endpoint", function=function) as operation:
+        while True:
+            with operation.current():
+                try:
+                    item = next(source)
+                except StopIteration:
+                    return
+            if serialize_item is not None:
+                with _operation(name="serialization", function=function):
+                    item = serialize_item(item)
+            yield item
+
+
+async def _async_endpoint_stream(
+    function: Callable[..., Any] | None,
+    source: AsyncIterator[Any],
+    serialize_item: Callable[[Any], bytes] | None,
+    *,
+    checkpoint: bool,
+) -> AsyncIterator[Any]:
+    # Same span lifetime as _sync_endpoint_stream. current() ends before yield
+    # so encoding, response sending, and the SSE keepalive task are not children.
+    with _streaming_operation(name="endpoint", function=function) as operation:
+        while True:
+            with operation.current():
+                try:
+                    item = await anext(source)
+                except StopAsyncIteration:
+                    return
+            if serialize_item is not None:
+                with _operation(name="serialization", function=function):
+                    item = serialize_item(item)
+            yield item
+            if checkpoint:
+                # To allow for cancellation to trigger
+                # Ref: https://github.com/fastapi/fastapi/issues/14680
+                await anyio.sleep(0)
+
+
 def _build_response_args(
     *, status_code: int | None, solved_result: Any
 ) -> dict[str, Any]:
@@ -600,8 +649,13 @@ def get_request_handler(
 
                     async def _producer() -> None:
                         async with send_stream:
-                            async for raw_item in sse_aiter:
-                                await send_stream.send(_serialize_sse_item(raw_item))
+                            async for payload in _async_endpoint_stream(
+                                dependant.call,
+                                sse_aiter,
+                                _serialize_sse_item,
+                                checkpoint=False,
+                            ):
+                                await send_stream.send(payload)
 
                     send_keepalive, receive_keepalive = (
                         anyio.create_memory_object_stream[bytes](max_buffer_size=1)
@@ -673,24 +727,20 @@ def get_request_handler(
                     return _serialize_data(item) + b"\n"
 
                 if _is_async_gen_callable(dependant.call):
-
-                    async def _async_stream_jsonl() -> AsyncIterator[bytes]:
-                        async for item in gen:
-                            yield _serialize_item(item)
-                            # To allow for cancellation to trigger
-                            # Ref: https://github.com/fastapi/fastapi/issues/14680
-                            await anyio.sleep(0)
-
-                    jsonl_stream_content: AsyncIterator[bytes] | Iterator[bytes] = (
-                        _async_stream_jsonl()
+                    jsonl_stream_content: AsyncIterator[Any] | Iterator[Any] = (
+                        _async_endpoint_stream(
+                            dependant.call,
+                            gen,
+                            _serialize_item,
+                            checkpoint=True,
+                        )
                     )
                 else:
-
-                    def _sync_stream_jsonl() -> Iterator[bytes]:
-                        for item in gen:  # ty: ignore[not-iterable]
-                            yield _serialize_item(item)
-
-                    jsonl_stream_content = _sync_stream_jsonl()
+                    jsonl_stream_content = _sync_endpoint_stream(
+                        dependant.call,
+                        iter(gen),
+                        _serialize_item,
+                    )
 
                 response_args = _build_response_args(
                     status_code=status_code, solved_result=solved_result
@@ -704,24 +754,25 @@ def get_request_handler(
             elif _is_async_gen_callable(dependant.call) or _is_gen_callable(
                 dependant.call
             ):
-                # Raw streaming with explicit response_class (e.g. StreamingResponse)
+                # Raw streaming with explicit response_class (e.g. StreamingResponse).
+                # Byte streams get the endpoint span only, no serialization span.
                 gen = dependant.call(**solved_result.values)
                 if _is_async_gen_callable(dependant.call):
-
-                    async def _async_stream_raw(
-                        async_gen: AsyncIterator[Any],
-                    ) -> AsyncIterator[Any]:
-                        async for chunk in async_gen:
-                            yield chunk
-                            # To allow for cancellation to trigger
-                            # Ref: https://github.com/fastapi/fastapi/issues/14680
-                            await anyio.sleep(0)
-
-                    gen = _async_stream_raw(gen)
+                    raw_content: AsyncIterator[Any] | Iterator[Any] = (
+                        _async_endpoint_stream(
+                            dependant.call, gen, None, checkpoint=True
+                        )
+                    )
+                else:
+                    raw_content = _sync_endpoint_stream(
+                        dependant.call,
+                        iter(gen),
+                        None,
+                    )
                 response_args = _build_response_args(
                     status_code=status_code, solved_result=solved_result
                 )
-                response = actual_response_class(content=gen, **response_args)
+                response = actual_response_class(content=raw_content, **response_args)
                 response.headers.raw.extend(solved_result.response.headers.raw)
             else:
                 raw_response = await run_endpoint_function(
